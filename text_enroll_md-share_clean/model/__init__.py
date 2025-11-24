@@ -1,0 +1,15 @@
+#__all__ = ['DoubleAE']
+# new model append in m_dict
+from model import TransformerKWSPhone_nocross_w_ctc
+from model import TransformerKWSPhone_speech_only
+from model import TransformerKWSPhone_nocross_w_ctc_kw_adapter
+from model import TransformerKWSPhone_nocross_w_ctc_kw_adapter_nonlinear
+from model import TransformerKWSPhone_sph_emb_concat_ctc_det
+
+m_dict = {
+    'TransformerKWSPhone_nocross_w_ctc': TransformerKWSPhone_nocross_w_ctc.TransformerKWSPhone_nocross_w_ctc,
+    'TransformerKWSPhone_speech_only': TransformerKWSPhone_speech_only.TransformerKWSPhone_speech_only,
+    'TransformerKWSPhone_nocross_w_ctc_kw_adapter': TransformerKWSPhone_nocross_w_ctc_kw_adapter.TransformerKWSPhone_nocross_w_ctc_kw_adapter,
+    'TransformerKWSPhone_nocross_w_ctc_kw_adapter_nonlinear': TransformerKWSPhone_nocross_w_ctc_kw_adapter_nonlinear.TransformerKWSPhone_nocross_w_ctc_kw_adapter_nonlinear,
+    'TransformerKWSPhone_sph_emb_concat_ctc_det': TransformerKWSPhone_sph_emb_concat_ctc_det.TransformerKWSPhone_sph_emb_concat_ctc_det
+}

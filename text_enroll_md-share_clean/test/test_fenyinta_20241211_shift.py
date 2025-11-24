@@ -1,0 +1,513 @@
+import os
+import yaml
+import json
+import torch
+import torchaudio
+import torchaudio.compliance.kaldi as kaldi
+import sys
+
+from yamlinclude import YamlIncludeConstructor
+from local.utils import make_dict_from_file
+from model import m_dict
+from torch.nn.utils.rnn import pad_sequence
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+from pypinyin import pinyin, Style
+import numpy as np
+import copy
+import torch.nn.functional as F
+
+test_config_file = sys.argv[1]
+speech_batch_size = int(sys.argv[2])
+cross_batch_size = int(sys.argv[3])
+
+
+shift_per_hour = 10 * 3600
+YamlIncludeConstructor.add_to_loader_class(loader_class=yaml.FullLoader)
+test_config = yaml.load(open(test_config_file), Loader=yaml.FullLoader)
+testset_dir = test_config['testset_dir']
+train_config = test_config.get('train_config', None)
+train_datalist = train_config['data_config']['data_list']
+train_data_dir = os.path.dirname(train_datalist)
+test_result_dir = test_config['test_result_dir']
+exp_dir = train_config['exp_config']['exp_dir']
+trained_ckpt_path = os.path.join(exp_dir, 'kwatt_asr_avg.pt')
+if 'trained_ckpt' in test_config:
+    trained_ckpt_path = test_config['trained_ckpt']
+
+word2id = make_dict_from_file(train_data_dir+'/word2id.txt')
+id2word = {int(v): k for k, v in word2id.items()}
+chunk_shift = test_config['chunk_shift']
+chunk_size = test_config['chunk_size']
+plot_each_word = test_config.get('plot_each_word', False)
+test_option = test_config['test_option']
+pos_shift = test_option['pos_shift']
+neg_shift = test_option['neg_shift']
+use_pos_pos_trials = test_option['use_pos_pos_trials']
+count_top1_keyword = test_option['count_top1_keyword']
+count_best_chunk = test_option['count_best_chunk']
+
+dcf_config = test_config.get('dcf_config', None)
+if dcf_config is not None:
+    cost_miss = dcf_config['cost_miss']
+    cost_fa = dcf_config['cost_fa']
+    prior_target = dcf_config['prior_target']
+
+os.makedirs(test_result_dir, exist_ok=True)
+
+def backup_configs():
+     # train config backup in result dir
+     train_f = open("{}/train.yaml".format(test_result_dir), 'w')
+     yaml.dump(train_config, train_f)
+     # test config backup in result dir
+     test_f = open("{}/test.yaml".format(test_result_dir), 'w')
+     yaml.dump(test_config, test_f)
+
+def make_fenyinta():
+    positive_scp = make_dict_from_file(testset_dir+'/positive.wav.scp')
+    negative_scp = make_dict_from_file(testset_dir+'/negative.wav.scp')
+    positive2target = make_dict_from_file(testset_dir+'/positive.txt')
+    keyword2phn = make_dict_from_file(testset_dir+'/keyword2phnseq')
+    phn2id = make_dict_from_file(train_data_dir+'/phone2id.txt')
+
+    keyword2phnid = {k: [phn2id[p] for p in v.split(" ")] for k, v in keyword2phn.items()}
+    keyword2id = {k: i for i, k in enumerate(keyword2phnid.keys())}
+    save_material = {
+        'keyword2phn': keyword2phn,
+        'keyword2phnid': keyword2phnid
+    }
+    meta_path = os.path.join(test_result_dir, 'fenyinta_meta.pt')
+    torch.save(save_material, meta_path)
+    positive_list_writer = open(os.path.join(test_result_dir, 'positive.datalist.txt'), 'w')
+    for utt, wav in positive_scp.items():
+        one_obj = dict(
+            key=utt,
+            sph=wav,
+            target_keyword_id=keyword2id[positive2target[utt]],
+            target_keyword = positive2target[utt]
+        )
+        positive_list_writer.write("{}\n".format(json.dumps(one_obj)))
+    
+    negative_list_writer = open(os.path.join(test_result_dir, 'negative.datalist.txt'), 'w')
+    for utt, wav in negative_scp.items():
+        one_obj = dict(
+            key=utt,
+            sph=wav
+        )
+        negative_list_writer.write("{}\n".format(json.dumps(one_obj)))
+
+
+FBANK_DEFAULT_SETTING = {
+    'num_mel_bins': 40, 'frame_length': 25, 'frame_shift': 10
+}
+
+def read_data_list(fname):
+    dlist = []
+    with open(fname) as tf:
+        for line in tf.readlines():
+            line = line.strip()
+            mix_obj = json.loads(line)
+            dlist.append(mix_obj)
+    return dlist
+
+
+
+def load_model():
+    print("trained_ckpt_path: {}".format(trained_ckpt_path))
+    trained_ckpt = torch.load(trained_ckpt_path)
+    trained_ckpt = trained_ckpt['model']
+
+    model_arch = test_config['test_model_arch']
+    #model_arch = train_config['model_arch']
+    
+    model_config = train_config['model_config']
+    model = m_dict[model_arch]
+    
+    num_audio_self_block = model_config.get('num_audio_self_block', None)
+    num_kw_self_block = model_config.get('num_kw_self_block', None)
+    num_au_kw_cross_block = model_config.get('num_au_kw_cross_block', None)
+    num_audio_self_block = test_config.get('num_audio_self_block', num_audio_self_block)
+    num_kw_self_block = test_config.get('num_kw_self_block', num_kw_self_block)
+    num_au_kw_cross_block = test_config.get('num_au_kw_cross_block', num_au_kw_cross_block)
+    model_config.update({'num_audio_self_block': num_audio_self_block})
+    model_config.update({'num_kw_self_block': num_kw_self_block})
+    model_config.update({'num_au_kw_cross_block': num_au_kw_cross_block})
+    print(model_config)
+
+    test_model = model(**model_config)
+    test_model.load_state_dict(trained_ckpt)
+    test_model.to('cuda:0')
+    test_model.eval()
+    return test_model
+
+def make_batch_keyword(keyword2id):
+
+    keyword_list = []
+    keyword_len = []
+    idx2keyword = {}
+    keyword2idx = {}
+    for i, (keyword, phn_seq) in enumerate(keyword2id.items()):
+        idx2keyword[i] = keyword
+        keyword2idx[keyword] = i
+        phn_seq = [1] + phn_seq + [2]
+        phn_seq = torch.tensor(phn_seq).to(torch.long)
+        keyword_list.append(phn_seq)
+        keyword_len.append(len(phn_seq))
+    keyword_list = pad_sequence(keyword_list, batch_first=True, padding_value=0)
+    return (keyword_list, torch.tensor(keyword_len), idx2keyword, keyword2idx)
+
+
+def print_feat(feat):
+    with open("test_feat_print.txt", 'a') as f_feat:
+        for i, keyword_feat in enumerate(feat):
+            for j, frame_feat in enumerate(keyword_feat):
+                f_feat.write("\n{}: {}: [".format(i, j))
+                for r, f in enumerate(frame_feat):
+                    if r == 0:
+                        f_feat.write("{}".format(f))
+                    else:
+                        f_feat.write(", {}".format(f))
+                f_feat.write("]")
+
+
+def inference_shift_batch(model, test_list, keyword_material, idx2keyword, keyword2idx, shift=False, chunk_size=chunk_size, speech_batch_size=1, cross_batch_size=1):
+    print("chunk_size: {}".format(chunk_size))
+    keyword, keyword_len = keyword_material
+    num_keyword = keyword.size(0)
+    print(num_keyword)
+    result = {}
+    utt2keyword_idx = {}
+    input_keyword = (keyword, keyword_len)
+    input_keyword = (d.to('cuda:0') for d in input_keyword)
+    keyword_embedding, keyword_mask = model.evaluate_kw_emb(input_keyword)
+    # print("keyword embedding size: {}, keyword mask size: {}".format(keyword_embedding.size(), keyword_mask.size()))
+    for i, obj in enumerate(test_list):
+        if i < 50:
+            print("utt: {}".format(i))
+        elif i % 300 == 0:
+            print("utt: {}".format(i))
+        key = obj['key']
+        if 'target_keyword' in obj:
+            utt2keyword_idx[key] = keyword2idx[obj['target_keyword']]
+        wav = torchaudio.load(obj['sph'])[0]
+        fbank = kaldi.fbank(wav, **FBANK_DEFAULT_SETTING)
+        fbank = fbank.unsqueeze(0)
+        # fbank = fbank.repeat(num_keyword, 1, 1)
+        # fbank_len = torch.tensor([fbank.size(1) for x in range(num_keyword)])
+        j = 0
+        result[key] = []
+        if not shift:
+            chunk_size = fbank.size(1)
+        input_batch = []
+        speech_batch_len = 0
+        cross_batch_len = 0
+        assert speech_batch_size % cross_batch_size == 0 and speech_batch_size >= cross_batch_size
+        chunk_len = torch.tensor([chunk_size]).to('cuda:0')
+        
+        while j * chunk_shift < fbank.size(1):
+        #while j * chunk_shift + chunk_size <= fbank.size(1):
+            #if j == 1:
+            #    print("chunk: {}".format(j))
+            if  j >= 1000 and j % 1000 == 0:
+                print("chunk: {}".format(j))
+            if j * chunk_shift + chunk_size <= fbank.size(1):
+                chunk = fbank[:, j * chunk_shift:j * chunk_shift + chunk_size, :]
+                #print("chunk shape: {}".format(chunk.shape))
+            else:
+                chunk = fbank[:, j * chunk_shift:, :]
+                len_remain = j * chunk_shift + chunk_size - fbank.size(1)
+                chunk = F.pad(chunk, pad=(0, 0, 0, len_remain), mode='constant', value=0)
+                #print("last chunk padded shape: {}".format(chunk.shape))
+
+            chunk = chunk.to('cuda:0')
+            speech_input = (chunk, chunk_len)
+            chunk, chunk_len = speech_input
+            if speech_batch_len == 0:
+                chunk_batch = copy.deepcopy(chunk)
+                chunk_len_batch = copy.deepcopy(chunk_len)
+            else:
+                chunk_batch = torch.cat((chunk_batch, chunk), dim=0)
+                chunk_len_batch = torch.cat((chunk_len_batch, chunk_len), dim=0)
+            speech_batch_len += 1
+            if speech_batch_len >= speech_batch_size:
+                speech_input_batch = (chunk_batch, chunk_len_batch)
+                # print("chunk size: {}, chunk_len: {}".format(chunk.size(), chunk_len))
+                speech_embedding_batch, speech_mask_batch = model.evaluate_sph_emb(speech_input_batch)
+                # print("speech embedding size: {}, speech mask size: {}".format(speech_embedding.size(), speech_mask.size()))
+                cross_batch_len = 0
+                while cross_batch_len + cross_batch_size <= speech_batch_len:
+                    speech_embedding_batch_sub = speech_embedding_batch[cross_batch_len:cross_batch_len+cross_batch_size, :, :]
+                    speech_mask_batch_sub = speech_mask_batch[cross_batch_len:cross_batch_len+cross_batch_size, :, :]
+                    # print("speech embedding batch size: {}, start index: {}, end index: {}".format(speech_embedding_batch.shape, cross_batch_len, cross_batch_len+cross_batch_size))
+                    # print("keyword embeding dim: {}, keyword mask dim: {}".format(keyword_embedding.size(), keyword_mask.size()))
+                    keyword_embedding_batch = keyword_embedding.repeat(cross_batch_size, 1, 1)
+                    keyword_mask_batch = keyword_mask.repeat(cross_batch_size, 1, 1)
+                    # print("speech embedding size: {}, speech mask size: {}, cross_batch_len: {}, cross_batch_size: {}".format(speech_embedding_batch.size(), speech_mask_batch.size(), cross_batch_len, cross_batch_size))
+                    speech_embedding_batch_sub = speech_embedding_batch_sub.repeat_interleave(num_keyword, dim=0)
+                    speech_mask_batch_sub = speech_mask_batch_sub.repeat_interleave(num_keyword, dim=0)
+                    # print("speech embedding size: {}, speech mask size: {}, keyword embedding size: {}, keyword mask size: {}, num_keyword: {}".format(speech_embedding_batch.size(), speech_mask_batch.size(), keyword_embedding_batch.size(), keyword_mask_batch.size(), num_keyword))
+                    cross_input_batch = (speech_embedding_batch_sub, speech_mask_batch_sub, keyword_embedding_batch, keyword_mask_batch)
+                    det_result_batch, hyp_batch = model.evaluate_cross_attention(cross_input_batch)
+                    # 将 det_result_batch 分组
+                    det_result_batches = det_result_batch.view(-1, num_keyword, det_result_batch.size(1)).to('cpu')
+                    det_result_batches = [[ i.item() for i in chunk ] for chunk in det_result_batches] 
+                    # 直接转换为列表并存储
+                    result[key].extend(det_result_batches)
+                    cross_batch_len += cross_batch_size
+                speech_batch_len = 0
+            if j * chunk_shift + chunk_size >= fbank.size(1):
+                break
+            j += 1
+        if speech_batch_len > 0:
+            speech_input_batch = (chunk_batch, chunk_len_batch)
+            # print("chunk size: {}, chunk_len: {}".format(chunk.size(), chunk_len))
+            speech_embedding_batch, speech_mask_batch = model.evaluate_sph_emb(speech_input_batch)
+            cross_batch_len = 0
+            while cross_batch_len + cross_batch_size <= speech_batch_len:
+                speech_embedding_batch_sub = speech_embedding_batch[cross_batch_len:cross_batch_len+cross_batch_size, :, :]
+                speech_mask_batch_sub = speech_mask_batch[cross_batch_len:cross_batch_len+cross_batch_size, :, :]
+                keyword_embedding_batch = keyword_embedding.repeat(cross_batch_size, 1, 1)
+                keyword_mask_batch = keyword_mask.repeat(cross_batch_size, 1, 1)
+                
+                # print("speech embedding size: {}, speech mask size: {}".format(speech_embedding.size(), speech_mask.size()))
+                speech_embedding_batch_sub = speech_embedding_batch_sub.repeat_interleave(num_keyword, dim=0)
+                speech_mask_batch_sub = speech_mask_batch_sub.repeat_interleave(num_keyword, dim=0)
+                cross_input_batch = (speech_embedding_batch_sub, speech_mask_batch_sub, keyword_embedding_batch, keyword_mask_batch)
+
+                det_result_batch, hyp_batch = model.evaluate_cross_attention(cross_input_batch)
+
+                # 将 det_result_batch 分组
+                det_result_batches = det_result_batch.view(-1, num_keyword, det_result_batch.size(1)).to('cpu')
+                det_result_batches = [[ i.item() for i in chunk ] for chunk in det_result_batches] 
+                # 直接转换为列表并存储
+                result[key].extend(det_result_batches)
+
+                cross_batch_len += cross_batch_size
+
+            if cross_batch_len < speech_batch_len:
+                speech_embedding_batch_sub = speech_embedding_batch[cross_batch_len:, :, :]
+                speech_mask_batch_sub = speech_mask_batch[cross_batch_len:, :, :]
+                keyword_embedding_batch = keyword_embedding.repeat(speech_embedding_batch_sub.size(0), 1, 1)
+                keyword_mask_batch = keyword_mask.repeat(speech_embedding_batch_sub.size(0), 1, 1)
+                # print("speech embedding size: {}, speech mask size: {}".format(speech_embedding.size(), speech_mask.size()))
+                speech_embedding_batch_sub = speech_embedding_batch_sub.repeat_interleave(num_keyword, dim=0)
+                speech_mask_batch_sub = speech_mask_batch_sub.repeat_interleave(num_keyword, dim=0)
+                #print("remaining batch: speech embedding batch sub size: {}, speech mask batch sub size: {}, keyword embedding batch size: {}, keyword mask batch size: {}".format(speech_embedding_batch_sub.size(), speech_mask_batch_sub.size(), keyword_embedding_batch.size(), keyword_mask_batch.size()))
+                cross_input_batch = (speech_embedding_batch_sub, speech_mask_batch_sub, keyword_embedding_batch, keyword_mask_batch)
+
+                det_result_batch, hyp_batch = model.evaluate_cross_attention(cross_input_batch)
+
+                # 将 det_result_batch 分组
+                det_result_batches = det_result_batch.view(-1, num_keyword, det_result_batch.size(1)).to('cpu')
+                det_result_batches = [[ i.item() for i in chunk ] for chunk in det_result_batches] 
+                # 直接转换为列表并存储
+                result[key].extend(det_result_batches)
+
+
+    return result, utt2keyword_idx
+
+
+def compute_dcf(y_true, y_scores, cost_miss, cost_fa, prior_target, test_result_dir, analysis_id, word_id, roc_auc, f_out_csv):
+    assert cost_miss > 0 and cost_miss <= 1
+    assert cost_fa > 0 and cost_fa <= 1
+    assert prior_target > 0 and prior_target < 1
+
+    fpr, tpr, thresholds_roc = roc_curve(y_true, y_scores)
+    print("skip first row of roc_curve with threshold inf")
+    fpr, tpr, thresholds_roc = fpr[1:], tpr[1:], thresholds_roc[1:]
+    roc_thresh_dict = {}
+    for i in range(len(fpr)):
+        roc_thresh_dict[thresholds_roc[i]] = (fpr[i], tpr[i])
+
+    # dcf(threshold) = cost_miss * prior_target * p_miss(threshold) + cost_fa * (1 - prior_target) * p_fa(threshold)
+    dcf = np.min(cost_miss * prior_target * (1 - tpr) + cost_fa * (1 - prior_target) * fpr)
+    dcf_index = np.argmin(cost_miss * prior_target * (1 - tpr) + cost_fa * (1 - prior_target) * fpr)
+    dcf_threshold = thresholds_roc[dcf_index]
+    print("cost_miss: {0}, cost_fa: {1}".format(cost_miss, cost_fa))
+    print("prior_target: {0}".format(prior_target))
+    print("DCF: {0:f}".format(dcf))
+    print("DCF threshold: {0}".format(dcf_threshold))
+    print("DCF p_miss: {0}".format(1 - tpr[dcf_index]))
+    print("DCF p_fa: {0}".format(fpr[dcf_index]))
+    print("DCF fa_per_hour: {0}".format(fpr[dcf_index]*shift_per_hour))
+    f_out_csv.write("{}\n".format(", ".join([str(word_id), str(roc_auc), str(cost_miss), str(cost_fa), str(prior_target), str(dcf), str(dcf_threshold), str(1-tpr[dcf_index]), str(fpr[dcf_index]), str(fpr[dcf_index]*shift_per_hour)])))
+
+
+def result_analysis_shift(positive_result, utt2keyword_idx, negative_result, test_result_dir, analysis_id, f_out_csv):
+    pos_hyp = []
+    pos_ref = []
+    for utt, result in positive_result.items():
+        target_keyword_idx = utt2keyword_idx[utt]
+        utt_pos_hyp = []
+        utt_pos_ref = []
+        for chunk in result:
+            if use_pos_pos_trials:
+                utt_pos_hyp.extend(chunk)
+                target_keyword_idx = utt2keyword_idx[utt]
+                one_hot = [0 for x in range(len(chunk))]
+                one_hot[target_keyword_idx] = 1
+                utt_pos_ref.extend(one_hot)
+            else:
+                chunk_target_score = chunk[target_keyword_idx]
+                #print("chunk: {}, target_keyword_idx: {}".format(chunk, target_keyword_idx))
+                if count_top1_keyword:
+                    if chunk_target_score != max(chunk):
+                        chunk_target_score = 0
+                utt_pos_hyp.append(chunk_target_score)
+                #print("chunk_target_score: {}".format(chunk_target_score))
+                utt_pos_ref.append(1)
+        if use_pos_pos_trials:
+            pos_hyp.extend(utt_pos_hyp)
+            pos_ref.extend(utt_pos_ref)
+        else:
+            if len(utt_pos_hyp) != 1:
+                print("utt_pos_hyp len: {}".format(len(utt_pos_hyp)))
+            if len(utt_pos_ref) != 1:
+                print("utt_pos_ref len: {}".format(len(utt_pos_ref)))
+            if [max(utt_pos_hyp)] != utt_pos_hyp or [max(utt_pos_ref)] != utt_pos_ref:
+                print([max(utt_pos_hyp)], [max(utt_pos_ref)])
+                print(utt_pos_hyp, utt_pos_ref)
+            if count_best_chunk:
+                pos_hyp.append(max(utt_pos_hyp))
+                pos_ref.append(max(utt_pos_ref))
+            else:
+                pos_hyp.extend(utt_pos_hyp)
+                pos_ref.extend(utt_pos_ref)
+
+    neg_hyp = []    
+    neg_ref = []
+    for utt, result in negative_result.items():
+        for chunk in result:
+            if count_top1_keyword:
+                chunk_target_score = max(chunk)
+                neg_hyp.append(chunk_target_score)
+                neg_ref.append(0)
+            else:
+                neg_hyp.extend(chunk)
+                one_hot = [0 for x in range(len(chunk))]
+                neg_ref.extend(one_hot)
+    
+    roc_auc = plot_roc_curve(pos_ref+neg_ref, pos_hyp+neg_hyp, test_result_dir, analysis_id, 'all')
+    if dcf_config is not None:
+        compute_dcf(pos_ref+neg_ref, pos_hyp+neg_hyp, cost_miss, cost_fa, prior_target, test_result_dir, analysis_id, 'all', roc_auc, f_out_csv)
+
+def plot_roc_curve(ref_score, hyp_score, test_result_dir, analysis_id, word_py):
+    fpr, tpr, thresholds = roc_curve(ref_score, hyp_score)
+
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.5f)' % roc_auc)
+    #plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC for {}'.format(word_py))
+    plt.legend(loc="lower right")
+    plt_path = os.path.join(test_result_dir, 'unet.transformer_{}.png'.format("{}-{}".format(analysis_id, word_py)))
+    plt.savefig(plt_path, dpi=400)
+    return roc_auc
+
+
+def result_analysis_shift_one_word(positive_result, utt2keyword_idx, negative_result, test_result_dir, analysis_id, one_word, one_word_idx, f_out_csv):
+    pos_hyp = []
+    pos_ref = []
+    one_word_py = ''.join([ i[0] for i in pinyin(one_word, style=Style.FIRST_LETTER) ])
+    for utt, result in positive_result.items():
+        target_keyword_idx = utt2keyword_idx[utt]
+        if target_keyword_idx != one_word_idx:
+            continue
+        utt_pos_hyp = []
+        utt_pos_ref = []
+        for chunk in result:
+            chunk_target_score = chunk[target_keyword_idx]
+            if count_top1_keyword:
+                if chunk_target_score != max(chunk):
+                    chunk_target_score = 0
+            utt_pos_hyp.append(chunk_target_score)
+            utt_pos_ref.append(1)
+        if [max(utt_pos_hyp)] != utt_pos_hyp or [max(utt_pos_ref)] != utt_pos_ref:
+            print([max(utt_pos_hyp)], [max(utt_pos_ref)])
+            print(utt_pos_hyp, utt_pos_ref)
+        if count_best_chunk:
+            pos_hyp.append(max(utt_pos_hyp))
+            pos_ref.append(max(utt_pos_ref))
+        else:
+            pos_hyp.extend(utt_pos_hyp)
+            pos_ref.extend(utt_pos_ref)
+
+    neg_hyp = []    
+    neg_ref = []
+    for utt, result in negative_result.items():
+        for chunk in result:
+            chunk_target_score = chunk[one_word_idx]
+            if count_top1_keyword:
+                if chunk_target_score != max(chunk):
+                    chunk_target_score = 0
+            neg_hyp.append(chunk_target_score)
+            neg_ref.append(0)
+    
+    roc_auc = plot_roc_curve(pos_ref+neg_ref, pos_hyp+neg_hyp, test_result_dir, analysis_id, one_word_py)
+    if dcf_config is not None:
+        compute_dcf(pos_ref+neg_ref, pos_hyp+neg_hyp, cost_miss, cost_fa, prior_target, test_result_dir, analysis_id, one_word_py, roc_auc, f_out_csv)
+
+
+if __name__ == '__main__':
+    
+    backup_configs()
+    result_id = '_'.join([str(int(pos_shift)), str(int(neg_shift))])
+    analysis_id = '_'.join([str(int(pos_shift)), str(int(neg_shift)), str(int(use_pos_pos_trials)), str(int(count_top1_keyword)), str(int(count_best_chunk))])
+    result_path = os.path.join(test_result_dir, 'test.result_{}.pt'.format(result_id))
+    meta_path = os.path.join(test_result_dir, 'fenyinta_meta.pt')
+    if not os.path.exists(meta_path): 
+        # 如果第一次做测试，需要将测试数据的一些信息存储在一个统一格式的文件fenyinta_meta.pt，方便后续测试
+        # 直接使用
+        make_fenyinta()
+    test_material = torch.load(meta_path)
+    model = load_model()
+    keyword2id = {k: [int(vv) for vv in v] for k, v in test_material['keyword2phnid'].items()}
+    keyword, keyword_len, idx2keyword, keyword2idx = make_batch_keyword(keyword2id)
+
+    positive_list = read_data_list(os.path.join(test_result_dir, 'positive.datalist.txt'))
+    positive_result_path = os.path.join(test_result_dir, 'test.result_pos_{}.pt'.format(int(pos_shift)))
+    if os.path.exists(positive_result_path):
+        test_result = torch.load(positive_result_path)
+        positive_result = test_result['pos_hyp']
+        utt2keyword_idx = test_result['pos_utt2keyword_idx']
+    else:
+        positive_result, utt2keyword_idx = inference_shift_batch(model, positive_list, (keyword, keyword_len), idx2keyword, keyword2idx, shift=pos_shift, chunk_size=chunk_size, speech_batch_size=speech_batch_size, cross_batch_size=cross_batch_size)
+        positive_test_result = {
+            'pos_hyp': positive_result,
+            'pos_utt2keyword_idx': utt2keyword_idx
+        }
+        torch.save(positive_test_result, positive_result_path)
+
+    negative_list = read_data_list(os.path.join(test_result_dir, 'negative.datalist.txt'))
+    negative_result_path = os.path.join(test_result_dir, 'test.result_neg_{}.pt'.format(int(neg_shift)))
+    if os.path.exists(negative_result_path):
+        test_result = torch.load(negative_result_path)
+        negative_result = test_result['neg_hyp']
+    else:
+        negative_result, _ = inference_shift_batch(model, negative_list, (keyword, keyword_len), idx2keyword, keyword2idx, shift=neg_shift, chunk_size=chunk_size, speech_batch_size=speech_batch_size, cross_batch_size=cross_batch_size)
+        negative_test_result = {
+            'neg_hyp': negative_result
+        }
+        torch.save(negative_test_result, negative_result_path)
+    
+    # 由于不同的阈值会产生不同的 Recall 和 FA，所以我这里将每一条语言在每个关键词上的分数都存在了test.result.pt 中，
+    # 方便后续确定每个词的阈值。
+    test_result = {
+        'pos_hyp': positive_result, 'neg_hyp': negative_result, 'pos_utt2keyword_idx': utt2keyword_idx,
+        'idx2keyword': idx2keyword
+    }
+    #最终会根据测试结果统一画一个 roc 曲线。
+    out_csv = os.path.join(test_result_dir, "dcf_auc_{}_{}_{}_{}.csv".format(cost_miss, cost_fa, prior_target, analysis_id))
+    f_out_csv = open(out_csv, 'w')
+    result_analysis_shift(positive_result, utt2keyword_idx, negative_result, test_result_dir, analysis_id, f_out_csv)
+    if plot_each_word:
+        for keyword, keywordidx in keyword2idx.items():
+            print(keyword, keywordidx)
+            result_analysis_shift_one_word(positive_result, utt2keyword_idx, negative_result, test_result_dir, analysis_id, keyword, keywordidx, f_out_csv)
+    f_out_csv.close()
