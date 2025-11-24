@@ -1,0 +1,21 @@
+# path of trained MD model checkpoint
+trained_ckpt_path: /work104/lishuailong/text_enroll_md-share_clean/exp/train_config_english_librispeech_V1/run_20251119_130501/kwatt_asr_avg_35-40.pt
+# config file for model training
+train_config: !include /work104/lishuailong/text_enroll_md-share_clean/config/train_config/TransformerKWS_nocross/train_config_english_librispeech_V1_ph_da.yaml
+# phone2id file for training datalist
+phone: /work104/lishuailong/librispeech_cleaned_data/datalist/phone2id.english.txt
+# wav.scp for test audio
+wav_scp: /work104/lishuailong/L2_ARCTIC_test_data/wav_16k_filtered.scp
+# pronunication correctness human label (1 means correct) for test data
+human_label: /work104/lishuailong/L2_ARCTIC_test_data/human_scores.json
+# output path to save model score and human label
+result_label_score: /work104/lishuailong/text_enroll_md-share_clean/result/train_config_english_librispeech_V1_ph_da/run_20251121_232858/my_test_results.json 
+# result/aishell2_cut_gt400_kaldi_lex2_tone_whole_utt_neg_by_lex_pos0.01_change0.8_w0.1_0.1_0.1_0.7_spec_mask_w_psok_hanlp_md_transformer_4sph_4kw_4concat_ctc_det_reverb_perturb_nomix_keyword_init_final_seg_pos_spec0.8_avg35_40_dec_gop/uych_child_31492_unambig/result_label_score.json
+# whether decode phone sequence for test audio
+is_decode: True
+# whether compute GOP for test data
+is_gop: True
+# list of target precision to locate some comparable point on PR curve
+target_precision: [0.18, 0.21]
+#target_precision: [0.21]
+#target_precision: [0.21, 0.32]
